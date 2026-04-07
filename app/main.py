@@ -4,7 +4,7 @@ import random
 import secrets
 import smtplib
 import ssl
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from email.message import EmailMessage
 from typing import Literal
 import bcrypt
@@ -68,7 +68,7 @@ class SignUpRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
 
-class ResetPasswordValidationRequest():
+class ResetPasswordValidationRequest(BaseModel):
     email: EmailStr
     code: str
 
@@ -76,6 +76,11 @@ def hash_reset_code(email: str, code: str) -> str:
     value = f"{email.lower().strip()}:{code}"
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
+def generate_reset_session_token() -> str:
+    return secrets.token_urlsafe(32)
+
+def hash_reset_token(token:str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 def send_reset_email(to_email: str, code: str) -> None:
     msg = EmailMessage()
@@ -239,7 +244,7 @@ async def request_password_reset(req: ResetPasswordRequest):
 
     code = generate_six_digit_code()
     code_hash = hash_reset_code(email, code)
-    expires_at = datetime.now(UTC) + datetime.timedelta(minutes=15)
+    expires_at = datetime.now(UTC) + timedelta(minutes=15)
 
     await conn.execute(
         "DELETE FROM password_reset_codes WHERE user_id = $1",
@@ -258,13 +263,81 @@ async def request_password_reset(req: ResetPasswordRequest):
 
     try:
         send_reset_email(email, code)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(f"Failed to send email."))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to send email.")
 
     return {
         "message": "If that email exists, a reset code has been sent."
     }
 
 @app.post(f"/api/v{API_VERSION}/password_reset/validate")
-async def validate_password_reset():
-    pass
+async def validate_password_reset(req: ResetPasswordValidationRequest):
+    email = req.email.lower().strip()
+    code = req.code.strip()
+
+    if not code.isdigit() or len(code) != 6:
+        raise HTTPException(status_code = 400, detail = "Invalid code format.")
+
+    code_hash = hash_reset_code(email, code)
+    reset_token = generate_reset_session_token()
+    reset_token_hash = hash_reset_token(token=reset_token)
+    session_expires_at = datetime.now(UTC) + timedelta(timedelta = 20)
+
+    async with app.state.db.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT id FROM users WHERE email = $1",
+            email
+        )
+
+        if not user:
+            raise HTTPException(status_code= 400, detail="Invalid or expired reset code.")
+
+        reset_code_row = await conn.fetchrow(
+            """
+            SELECT id
+            FROM password_reset_codes
+            WHERE user_id = $1
+                AND code_hash = $2
+                AND expires_at > now()
+            ORDER BY expires_at DESC
+            LIMIT 1
+            """,
+            user["id"],
+            code_hash
+        )
+
+        if not reset_code_row:
+            raise HTTPException(status_code=400, detail="Invalid or expired reset code.")
+
+        # Consumes the code sent to the users email to prevent code resuing.
+        await conn.execute(
+            """
+            DELETE FROM password_reset_codes WHERE id = $1
+            """,
+            reset_code_row["id"]
+        )
+
+        # Delete old sessions for this user.
+        await conn.execute(
+            """
+            DELETE FROM password_reset_sessions WHERE id = $1
+            """,
+            user["id"]
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO password_reset_codes (user_id, code_hash, expires_at)
+            VALUES($1, $2, $3)
+            """,
+            user["id"],
+            reset_token_hash,
+            session_expires_at,
+        )
+
+    return {
+        "message": "Reset code is valid",
+        "reset_token": reset_token,
+        "token_type": "bearer",
+        "expires_in": 1200
+    }

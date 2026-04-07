@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    container_name: dayring-api
+    restart: unless-stopped
+    environment:
+      HF_API_KEY: "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"
+      HF_MODEL: "openai/gpt-oss-120b:novita"
+      PSQL_PASSWORD: "wawashoes"
+    ports:
+      - "8000:8000"
