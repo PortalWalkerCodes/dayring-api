@@ -16,8 +16,7 @@ from pydantic import BaseModel, Field, ConfigDict, EmailStr
 app = FastAPI(title="DayRing API", version="1.0.0")
 
 API_VERSION = 1
-DATABASE_URl = f"postgresql://atticus:{os.getenv('PSQL_PASSWORD')}@localhost:5432/dayring_api"
-
+DATABASE_URl = f"postgresql://atticus:{os.getenv('PSQL_PASSWORD')}@10.0.0.235:5432/dayring_api"
 HF_API_KEY = os.getenv("HF_API_KEY")
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_MODEL = os.getenv("HF_MODEL", "openai/gpt-oss-120b:novita")
@@ -63,6 +62,7 @@ class CreditsResponse(BaseModel):
 
 class SignUpRequest(BaseModel):
     email: EmailStr
+    username: str = Field(..., max_length=20, min_length=3)
     password: str = Field(... ,max_length=72, min_length=8)
 
 class ResetPasswordRequest(BaseModel):
@@ -71,6 +71,10 @@ class ResetPasswordRequest(BaseModel):
 class ResetPasswordValidationRequest(BaseModel):
     email: EmailStr
     code: str
+
+class ResetPasswordConfirmationRequest(BaseModel):
+    password: str = Field(..., max_length=72, min_length=8)
+    authorization: str
 
 def hash_reset_code(email: str, code: str) -> str:
     value = f"{email.lower().strip()}:{code}"
@@ -101,7 +105,7 @@ def send_reset_email(to_email: str, code: str) -> None:
 
 @app.on_event("startup")
 async def startup():
-    app.state.db = await asyncpg.create_pool(DATABASE_URl)
+    app.state.db = await asyncpg.create_pool(DATABASE_URl, ssl = False)
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -191,34 +195,37 @@ async def chat(
 @app.post(f"/api/v{API_VERSION}/signup")
 async def signup(req: SignUpRequest):
     email = req.email.lower().strip()
+    username = req.username.lower().strip()
 
     async with app.state.db.acquire() as conn:
         existing_user = await conn.fetchrow(
-            "SELECT id FROM users WHERE email = $1",
-            email
+            "SELECT id FROM users WHERE email = $1 OR username = $2",
+            email,
+            username
         )
 
-    if existing_user:
-        raise HTTPException(status_code=409, detail="Email already registered.")
+        if existing_user:
+            raise HTTPException(status_code=409, detail="Email or username already registered.")
 
-    hashed_password = bcrypt.hashpw(
+        hashed_password = bcrypt.hashpw(
         req.password.encode("utf-8"),
         bcrypt.gensalt(),
-    ).decode("utf-8")
+        ).decode("utf-8")
 
-    async with app.state.db.acquire() as conn:
         user = await conn.fetchrow(
             """
-            INSERT INTO users (email, password_hash)
-            VALUES($1, $2)
+            INSERT INTO users (email,username,password_hash)
+            VALUES($1, $2, $3)
             RETURNING id
             """,
             email,
+            username,
             hashed_password
         )
     return {
         "user_id": user["id"],
         "email": email,
+        "username": username,
         "message": "User successfully created!",
     }
 
@@ -237,29 +244,29 @@ async def request_password_reset(req: ResetPasswordRequest):
              email
         )
 
-    if not user:
-        return {
-            "message": "If that email exists, a reset code has been sent."
-        }
+        if not user:
+            return {
+                "message": "If that email exists, a reset code has been sent."
+            }
 
-    code = generate_six_digit_code()
-    code_hash = hash_reset_code(email, code)
-    expires_at = datetime.now(UTC) + timedelta(minutes=15)
+        code = generate_six_digit_code()
+        code_hash = hash_reset_code(email, code)
+        expires_at = datetime.now(UTC) + timedelta(minutes=15)
 
-    await conn.execute(
-        "DELETE FROM password_reset_codes WHERE user_id = $1",
-        user["id"]
-    )
+        await conn.execute(
+            "DELETE FROM password_reset_codes WHERE user_id = $1",
+            user["id"]
+        )
 
-    await conn.execute(
-        """
-        INSERT INTO password_reset_codes (user_id, code_hash, expires_at)
-        VALUES($1, $2, $3)
-        """,
-        user["id"],
-        code_hash,
-        expires_at
-    )
+        await conn.execute(
+            """
+            INSERT INTO password_reset_codes (user_id, code_hash, expires_at)
+            VALUES($1, $2, $3)
+            """,
+            user["id"],
+            code_hash,
+            expires_at
+        )
 
     try:
         send_reset_email(email, code)
@@ -281,7 +288,7 @@ async def validate_password_reset(req: ResetPasswordValidationRequest):
     code_hash = hash_reset_code(email, code)
     reset_token = generate_reset_session_token()
     reset_token_hash = hash_reset_token(token=reset_token)
-    session_expires_at = datetime.now(UTC) + timedelta(timedelta = 20)
+    session_expires_at = datetime.now(UTC) + timedelta(minutes = 20)
 
     async with app.state.db.acquire() as conn:
         user = await conn.fetchrow(
@@ -320,14 +327,14 @@ async def validate_password_reset(req: ResetPasswordValidationRequest):
         # Delete old sessions for this user.
         await conn.execute(
             """
-            DELETE FROM password_reset_sessions WHERE id = $1
+            DELETE FROM password_reset_sessions WHERE user_id = $1
             """,
             user["id"]
         )
 
         await conn.execute(
             """
-            INSERT INTO password_reset_codes (user_id, code_hash, expires_at)
+            INSERT INTO password_reset_sessions (user_id, token_hash, expires_at)
             VALUES($1, $2, $3)
             """,
             user["id"],
@@ -340,4 +347,54 @@ async def validate_password_reset(req: ResetPasswordValidationRequest):
         "reset_token": reset_token,
         "token_type": "bearer",
         "expires_in": 1200
+    }
+
+@app.post(f"/api/v{API_VERSION}/password_reset/confirm")
+async def confirm_password_reset(
+        req: ResetPasswordConfirmationRequest,
+):
+    if req.authorization is None:
+        raise HTTPException(status_code=400, detail="Expired or invalid authorization token.")
+
+    raw_token = req.authorization
+
+    token_hash = hash_reset_token(raw_token)
+    new_password_hash = bcrypt.hashpw(req.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    async with app.state.db.acquire() as conn:
+        session_row = await conn.fetchrow(
+            """
+            SELECT id, user_id
+            FROM password_reset_sessions
+            WHERE token_hash = $1
+                AND expires_at > now()
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            token_hash
+        )
+        if not session_row:
+            raise HTTPException(status_code=400, detail="Expired or invalid reset token.")
+
+        # Updates the users password
+        await conn.execute(
+            """
+            UPDATE users
+            SET password_hash = $1
+            WHERE id = $2
+            """,
+            new_password_hash,
+            session_row["user_id"]
+        )
+
+        # Invalidates previous reset token
+        await conn.execute(
+            """
+            DELETE FROM password_reset_sessions WHERE id = $1
+            """,
+            session_row["id"]
+        )
+
+    return {
+        "message": "Password was reset successfully",
     }

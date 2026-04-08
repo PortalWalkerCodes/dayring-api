@@ -1,9 +1,6 @@
 fastapi
 uvicorn[standard]
 httpx
-sqlalchemy
-psycopg[binary]
-python-dotenv
-bcrypt
 asyncpg
-pydantic
+bcrypt
+pydantic[email]
