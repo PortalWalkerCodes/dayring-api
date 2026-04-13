@@ -4,6 +4,7 @@ import random
 import secrets
 import smtplib
 import ssl
+from contextlib import asynccontextmanager
 from datetime import datetime, UTC, timedelta
 from email.message import EmailMessage
 from typing import Literal
@@ -13,10 +14,15 @@ import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
 
-app = FastAPI(title="DayRing API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.db = await asyncpg.create_pool(DATABASE_URL, ssl=False)
+    yield
+    await app.state.db.close()
+app = FastAPI(title="DayRing API", version="1.0.0", lifespan=lifespan)
 
 API_VERSION = 1
-DATABASE_URl = f"postgresql://atticus:{os.getenv('PSQL_PASSWORD')}@10.0.0.235:5432/dayring_api"
+DATABASE_URL = f"postgresql://atticus:{os.getenv('PSQL_PASSWORD')}@10.0.0.235:5432/dayring_api"
 HF_API_KEY = os.getenv("HF_API_KEY")
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_MODEL = os.getenv("HF_MODEL", "openai/gpt-oss-120b:novita")
@@ -65,6 +71,10 @@ class SignUpRequest(BaseModel):
     username: str = Field(..., max_length=20, min_length=3)
     password: str = Field(... ,max_length=72, min_length=8)
 
+class LogInRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=72)
+
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
 
@@ -80,10 +90,10 @@ def hash_reset_code(email: str, code: str) -> str:
     value = f"{email.lower().strip()}:{code}"
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-def generate_reset_session_token() -> str:
+def generate_access_token() -> str:
     return secrets.token_urlsafe(32)
 
-def hash_reset_token(token:str) -> str:
+def hash_access_token(token:str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 def send_reset_email(to_email: str, code: str) -> None:
@@ -103,13 +113,9 @@ def send_reset_email(to_email: str, code: str) -> None:
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.send_message(msg)
 
-@app.on_event("startup")
-async def startup():
-    app.state.db = await asyncpg.create_pool(DATABASE_URl, ssl = False)
+def generate_six_digit_code():
+    return str(random.randrange(100_000, 1_000_000))
 
-@app.on_event("shutdown")
-async def shutdown():
-    await app.state.db.close()
 
 @app.get("/health")
 async def health():
@@ -192,7 +198,7 @@ async def chat(
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {str(e)}")
 
-@app.post(f"/api/v{API_VERSION}/signup")
+@app.post(f"/api/v{API_VERSION}/auth/signup")
 async def signup(req: SignUpRequest):
     email = req.email.lower().strip()
     username = req.username.lower().strip()
@@ -222,17 +228,71 @@ async def signup(req: SignUpRequest):
             username,
             hashed_password
         )
+
+        access_token = generate_access_token()
+        access_token_hash = hash_access_token(access_token)
+        expires_at = datetime.now(UTC) + timedelta(days=7)
+
+        await conn.execute(
+            """
+            INSERT INTO user_sessions (user_id, access_token, expires_at)
+            values ($1, $2, $3)
+            """,
+            user["id"], access_token_hash, expires_at
+        )
+
     return {
         "user_id": user["id"],
         "email": email,
         "username": username,
         "message": "User successfully created!",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": 604800
     }
 
 
-def generate_six_digit_code():
-    return str(random.randrange(100_000, 1_000_000))
+@app.post(f"/api/v{API_VERSION}/auth/login")
+async def login(req: LogInRequest):
+    email = req.email.lower().strip()
 
+    async with app.state.db.acquire() as conn:
+        user = await conn.fetchrow(
+            """
+            SELECT id, email, username, password_hash
+            FROM users
+            WHERE email = $1
+            """,
+            email
+        )
+
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        password_ok = bcrypt.checkpw(password=req.password.encode("utf-8"), hashed_password=user["password_hash"])
+
+        if not password_ok:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        access_token = generate_access_token()
+        token_hash = hash_access_token(access_token)
+        expires_at = datetime.now(UTC) + timedelta(days=7)
+
+        await conn.execute(
+            """
+            INSERT INTO user_sessions(user_id, token_hash, expires_at)
+            VALUES($1, $2, $3)
+            """,
+            user["id"], token_hash, expires_at
+        )
+    return {
+        "Message": "Login successful!",
+        "user_id": user["id"],
+        "user_email": user["email"],
+        "username": user["username"],
+        "access_token": access_token,
+        "expires_at": expires_at
+    }
 
 @app.post(f"/api/v{API_VERSION}/password_reset/request")
 async def request_password_reset(req: ResetPasswordRequest):
@@ -286,8 +346,8 @@ async def validate_password_reset(req: ResetPasswordValidationRequest):
         raise HTTPException(status_code = 400, detail = "Invalid code format.")
 
     code_hash = hash_reset_code(email, code)
-    reset_token = generate_reset_session_token()
-    reset_token_hash = hash_reset_token(token=reset_token)
+    reset_token = generate_access_token()
+    reset_token_hash = hash_access_token(token=reset_token)
     session_expires_at = datetime.now(UTC) + timedelta(minutes = 20)
 
     async with app.state.db.acquire() as conn:
@@ -358,7 +418,7 @@ async def confirm_password_reset(
 
     raw_token = req.authorization
 
-    token_hash = hash_reset_token(raw_token)
+    token_hash = hash_access_token(raw_token)
     new_password_hash = bcrypt.hashpw(req.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
     async with app.state.db.acquire() as conn:
