@@ -4,7 +4,9 @@ import random
 import secrets
 import smtplib
 import ssl
+import re
 from contextlib import asynccontextmanager
+from dataclasses import field
 from datetime import datetime, UTC, timedelta
 from email.message import EmailMessage
 from typing import Literal
@@ -12,7 +14,7 @@ import bcrypt
 import httpx
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Query
-from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from pydantic import BaseModel, Field, ConfigDict, EmailStr, field_validator
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -26,6 +28,7 @@ DATABASE_URL = f"postgresql://atticus:{os.getenv('PSQL_PASSWORD')}@10.0.0.235:54
 HF_API_KEY = os.getenv("HF_API_KEY")
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_MODEL = os.getenv("HF_MODEL", "openai/gpt-oss-120b:novita")
+HEX_CODE_RE = re.compile("^#(?:[0-9a-fA-F]{3}){1,2}$")
 
 SMTP_HOST:str = str(os.getenv("SMTP_HOST"))
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
@@ -49,7 +52,7 @@ credits = {
     "demo_user": 100
 }
 
-
+# Request and response models
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
@@ -86,6 +89,55 @@ class ResetPasswordConfirmationRequest(BaseModel):
     password: str = Field(..., max_length=72, min_length=8)
     authorization: str
 
+class TaskCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    color: str = Field(default="FF3B30", max_length=7)
+    notes: str = Field(default="", max_length=5000)
+    urgency: Literal["trivial", "medium", "urgent"] = "medium"
+    due_at: datetime | None = None
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, value: str) -> str:
+        value = value.strip()
+
+        if not HEX_CODE_RE.fullmatch(value):
+            raise ValueError("Color must be a valid 6-digit hex code, like FF3B30 or #FF3B30")
+
+        return value.lstrip("#").upper()
+
+class TaskUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    color: str | None = Field(default=None, max_length=7)
+    notes: str | None = Field(default= None, max_length=5000)
+    urgency: Literal["trivial", "medium", "urgent"] | None = None
+    due_at: datetime | None = None
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, value: str | None):
+        if value is None:
+            return None
+
+        value = value.strip()
+
+        if not HEX_CODE_RE.fullmatch(value):
+            raise ValueError("Color must be a valid 6-digit hex code, like FF3B30 or #FF3B30")
+
+        return value.lstrip("#").upper()
+
+class TaskResponse(BaseModel):
+    id: str
+    title: str
+    color: str
+    notes: str
+    urgency: str
+    is_completed: bool
+    due_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
 def hash_reset_code(email: str, code: str) -> str:
     value = f"{email.lower().strip()}:{code}"
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -116,6 +168,45 @@ def send_reset_email(to_email: str, code: str) -> None:
 def generate_six_digit_code():
     return str(random.randrange(100_000, 1_000_000))
 
+async def get_current_user_id(authorization: str | None) -> str:
+    """
+    :param authorization:
+    Takes in a users authorization token.
+    :return:
+    Returns their userID which is used for other functions.
+    """
+
+    if not authorization:
+        raise HTTPException(status_code = 401, detail="Missing authorization token")
+
+    parts = authorization.strip().split(" ", 1)
+
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authorization header must be: Bearer <token>")
+
+    raw_token = parts[1].strip()
+
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    token_hash = hash_access_token(raw_token)
+
+    async with app.state.db.acquire() as conn:
+        session = await conn.fetchrow(
+            """
+            SELECT user_id
+            FROM user_sessions
+            WHERE token_hash = $1
+                AND expires_at > now()
+            ORDER BY expires_at DESC
+            LIMIT 1
+            """,
+            token_hash
+        )
+    if not session:
+        raise HTTPException(status_code = 401, detail="Invaid or expired session")
+
+    return str(session["user_id"])
 
 @app.get("/health")
 async def health():
@@ -198,6 +289,7 @@ async def chat(
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {str(e)}")
 
+
 @app.post(f"/api/v{API_VERSION}/auth/signup")
 async def signup(req: SignUpRequest):
     email = req.email.lower().strip()
@@ -235,7 +327,7 @@ async def signup(req: SignUpRequest):
 
         await conn.execute(
             """
-            INSERT INTO user_sessions (user_id, access_token, expires_at)
+            INSERT INTO user_sessions (user_id, token_hash, expires_at)
             values ($1, $2, $3)
             """,
             user["id"], access_token_hash, expires_at
@@ -269,7 +361,10 @@ async def login(req: LogInRequest):
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-        password_ok = bcrypt.checkpw(password=req.password.encode("utf-8"), hashed_password=user["password_hash"])
+        password_ok = bcrypt.checkpw(
+            req.password.encode("utf-8"),
+            user["password_hash"].encode("utf-8")
+        )
 
         if not password_ok:
             raise HTTPException(status_code=401, detail="Invalid email or password.")
@@ -457,4 +552,138 @@ async def confirm_password_reset(
 
     return {
         "message": "Password was reset successfully",
+    }
+
+@app.get(f"/api/v{API_VERSION}/tasks", response_model=list[TaskResponse])
+async def get_tasks(authorization: str | None = Header(default=None)):
+    """
+    :param authorization:
+    Takes in authorization header generated from authorization endpoint.
+    :return:
+    Returns a dictionary with all cloud saved tasks for the authenticated user.
+    """
+
+    user_id = await get_current_user_id(authorization)
+
+    async with app.state.db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, title, color, notes, is_completed, urgency, due_at, created_at, updated_at
+            FROM tasks
+            WHERE user_id = $1
+            ORDER BY is_completed ASC, created_at DESC
+            """,
+            user_id
+        )
+    return [TaskResponse(**dict(row)) for row in rows]
+
+@app.post(f"/api/v{API_VERSION}/tasks/create", response_model= TaskResponse)
+async def create_task(req: TaskCreateRequest, authorization: str | None = Header(default=None)):
+    user_id = await get_current_user_id(authorization)
+
+    async with app.state.db.acquire() as conn:
+        rows = conn.fetchrow(
+            """
+            INSERT INTO tasks (user_id, title, color, notes, urgency, due_at)
+            VALUES($1, $2, $3, $4, $5, $6)
+            RETURNING id, title, color, notes, is_completed, urgency, due_at, created_at, updated_at
+            """,
+            user_id,
+            req.title,
+            req.color,
+            req.notes,
+            req.urgency,
+            req.due_at
+        )
+    if not rows:
+        raise HTTPException(status_code=500, detail="Task creation failed")
+
+    return [TaskResponse(**dict(row)) for row in rows]
+
+@app.patch(f"/api/v{API_VERSION}/tasks/{{task_id}}", response_model= TaskResponse)
+async def update_task(
+        task_id: int,
+        req:TaskUpdateRequest,
+        authorization: str | None = Header(default=None)
+):
+
+    user_id = await get_current_user_id(authorization)
+
+    updates = []
+    values = []
+    params_index = 1
+
+    if req.title is not None:
+        updates.append(f"title = ${params_index}")
+        values.append(req.title.strip())
+        params_index += 1
+
+    if req.color is not None:
+        updates.append(f"color = ${params_index}")
+        values.append(req.color)
+        params_index += 1
+
+    if req.notes is not None:
+        updates.append(f"notes = ${params_index}")
+        values.append(req.notes)
+        params_index += 1
+
+    if req.urgency is not None:
+        updates.append(f"urgency = ${params_index}")
+        values.append(req.urgency)
+        params_index += 1
+
+    if req.due_at is not None:
+        updates.append(f"due_at = ${params_index}")
+        values.append(req.due_at)
+        params_index += 1
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    updates.append("updated_at = now()")
+
+    values.append(task_id)
+    values.append(user_id)
+
+    query = f"""
+        UPDATE tasks
+        SET {', '.join(updates)}
+        WHERE id = ${params_index} AND user_id = ${params_index + 1}
+        RETURNING id, title, color, notes, is_completed, urgency, due_at, created_at, updated_at
+    """
+
+    async with app.state.db.acquire() as conn:
+        row = await conn.fetchrow(query, *values)
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return TaskResponse(**dict(row)) if row else None
+
+
+@app.delete(f"/api/v{API_VERSION}/tasks/{{task_id}}")
+async def delete_task(
+        task_id: int,
+        authorization: str | None = Header(default=None)
+):
+    user_id = await get_current_user_id(authorization)
+
+    async with app.state.db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            DELETE FROM tasks
+            WHERE id = $1 AND user_id = $2
+            RETURNING id
+            """,
+            task_id,
+            user_id
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return {
+        "message": "Task successfully deleted.",
+        "deleted_task_id": task_id
     }
