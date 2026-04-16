@@ -15,6 +15,11 @@ import httpx
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field, ConfigDict, EmailStr, field_validator
+from pathlib import Path
+from uuid import uuid4
+from fastapi import UploadFile, File, Request
+from fastapi.staticfiles import StaticFiles
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -35,6 +40,12 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = str(os.getenv("SMTP_USER"))
 SMTP_PASSWORD = str(os.getenv("SMTP_PASSWORD"))
 SMTP_FROM_EMAIL = str(os.getenv("SMTP_FROM_EMAIL"))
+
+UPLOAD_DIR = Path("uploads/profile_pictures")
+UPLOAD_DIR.mkdir(parents= True, exist_ok= True)
+
+# Mounts the virtual path /uploads to the port specified in the docker-compose.yml file eg api.dayring.app/uploads
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD or not SMTP_FROM_EMAIL:
     raise RuntimeError("SMTP environment variables are not fully set")
@@ -78,11 +89,17 @@ class LogInRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=72)
 
-class MeResponse(BaseModel):
+class GetMeResponse(BaseModel):
     id: str
     email: EmailStr
     username: str
+    profile_picture_url: str | None = None
     created_at: datetime
+
+class UpdateMeRequest(BaseModel):
+    email: EmailStr | None
+    username: str | None = Field(..., min_length=3, max_length=20)
+    profile_picture_url: str | None = None
 
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
@@ -580,14 +597,14 @@ async def confirm_password_reset(
         "message": "Password was reset successfully",
     }
 
-@app.get(f"/api/v{API_VERSION}/me", response_model=MeResponse)
+@app.get(f"/api/v{API_VERSION}/me", response_model=GetMeResponse)
 async def get_me(authorization: str = Header(None)):
     user_id = get_current_user_id(authorization)
 
     async with app.state.db.acquire() as conn:
         user = await conn.fetchrow(
             """
-            SELECT id, email, username, created_at
+            SELECT id, email, username, profile_picture_url, streak , created_at
             FROM users
             WHERE id = $1
             """,
@@ -597,7 +614,107 @@ async def get_me(authorization: str = Header(None)):
     if not user:
         raise HTTPException(status_code= 404, detail="User not found")
 
-    return MeResponse(**dict(user))
+    return GetMeResponse(**dict(user))
+
+@app.patch(f"/api/v{API_VERSION}/me")
+async def update_me(
+        req: UpdateMeRequest,
+        authorization: str | None = Header(default=None)
+
+):
+    user_id = await get_current_user_id(authorization)
+
+    updates = []
+    values = []
+    params_index = 1
+
+    if req.email is not None:
+        updates.append(f"email = ${params_index}")
+        values.append(req.email)
+        params_index += 1
+
+    if req.username is not None:
+        updates.append(f"username = ${params_index}")
+        values.append(req.username)
+        params_index += 1
+
+
+    if updates is None:
+        raise HTTPException(status_code=400, detail="No parameters to update.")
+
+    values.append(user_id)
+
+    query = f"""
+        UPDATE users
+        SET {', '.join(updates)}
+        WHERE user_id = ${params_index}
+    """
+
+    async with app.state.db.acquire() as conn:
+        row = await conn.fetchrow(query, *values)
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return{"message": "User successfully updated"}
+
+@app.post(f"/api/v{API_VERSION}/me/profile-picture")
+async def upload_profile_picture(
+        request: Request,
+        file: UploadFile = File(...),
+        authorization: str | None = Header(default=None)
+):
+    user_id = await get_current_user_id(authorization)
+
+    allowed_types = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }
+
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, and WEBP images are allowed")
+
+    contents = await file.read()
+
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Max size 5MB.")
+
+    ext = allowed_types[file.content_type]
+
+    for ext_candidate in [".jpg", ".png", ".webp"]:
+        old_file = UPLOAD_DIR / f"{user_id}{ext_candidate}"
+        if old_file.exists():
+            old_file.mkdir()
+
+    filename = f"{user_id}{ext}"
+    file_path = UPLOAD_DIR / filename
+
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    public_url = f"{request.base_url}uploads/profile_pictures/{filename}"
+
+    async with app.state.db.aquire() as conn:
+        result = conn.execute(
+            """
+            UPDATE users
+            SET profile_picture_url = $1
+            WHERE id = $2
+            """,
+            public_url,
+            user_id
+        )
+
+    if result == "UPDATE 0":
+        if file_path.exists():
+            file_path.unlink()
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    return {
+        "message": "Profile picture successfully uploaded",
+        "profile_picture_url": public_url
+    }
 
 @app.get(f"/api/v{API_VERSION}/tasks", response_model=list[TaskResponse])
 async def get_tasks(authorization: str | None = Header(default=None)):
@@ -732,3 +849,55 @@ async def delete_task(
         "message": "Task successfully deleted.",
         "deleted_task_id": task_id
     }
+
+@app.post(f"/api/v{API_VERSION}/tasks/{{task_id}}/complete", response_model= TaskResponse)
+async def complete_task(
+        task_id: int,
+        authorization: str | None = Header(default=None)
+):
+    user_id = await get_current_user_id(authorization)
+
+    async with app.state.db.aquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE tasks
+            SET is_completed = TRUE, updated_at = now()
+            WHERE id = $1 AND user_id = $2
+            RETURNING id, title, color, notes, is_completed, urgency, due_at, created_at, updated_at
+            """
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return TaskResponse(**dict(row))
+
+@app.post(f"/api/v{API_VERSION}/tasks/{{task_id}}/uncomplete", response_model= TaskResponse)
+async def uncomplete_task(
+        task_id: int,
+        authorization: str | None = Header(default=None)
+):
+    """
+    :param task_id:
+    The id returned when creating or fetching a task
+    :param authorization:
+    The token returned when signing up or logging in to DayRing
+    :return:
+    Returns updated task information
+    """
+    user_id = await get_current_user_id(authorization)
+
+    async with app.state.db.aquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE tasks
+            SET is_completed = FALSE, updated_at = now()
+            WHERE id = $1 AND user_id = $2
+            RETURNING id, title, color, notes, is_completed, urgency, due_at, created_at, updated_at
+            """
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return TaskResponse(**dict(row))
