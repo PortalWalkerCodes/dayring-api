@@ -78,6 +78,12 @@ class LogInRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=72)
 
+class MeResponse(BaseModel):
+    id: str
+    email: EmailStr
+    username: str
+    created_at: datetime
+
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
 
@@ -389,6 +395,26 @@ async def login(req: LogInRequest):
         "expires_at": expires_at
     }
 
+@app.post(f"/api/v{API_VERSION}/auth/logout")
+async def logout(authorization: str | None = Header(default=None)):
+    user_id = get_current_user_id(authorization)
+
+    async with app.state.db.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM user_sessions
+            WHERE user_id = $1
+            """,
+            user_id
+        )
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Session not found. (If you are seeing this it most likely means "
+                                                    "the frontend and did not visually logged out but just restart "
+                                                    "the app and you should be logged out.)")
+
+    return {"message": "Logged out successfully!"}
+
 @app.post(f"/api/v{API_VERSION}/password_reset/request")
 async def request_password_reset(req: ResetPasswordRequest):
     email = req.email.lower().strip()
@@ -553,6 +579,25 @@ async def confirm_password_reset(
     return {
         "message": "Password was reset successfully",
     }
+
+@app.get(f"/api/v{API_VERSION}/me", response_model=MeResponse)
+async def get_me(authorization: str = Header(None)):
+    user_id = get_current_user_id(authorization)
+
+    async with app.state.db.acquire() as conn:
+        user = await conn.fetchrow(
+            """
+            SELECT id, email, username, created_at
+            FROM users
+            WHERE id = $1
+            """,
+            user_id
+        )
+
+    if not user:
+        raise HTTPException(status_code= 404, detail="User not found")
+
+    return MeResponse(**dict(user))
 
 @app.get(f"/api/v{API_VERSION}/tasks", response_model=list[TaskResponse])
 async def get_tasks(authorization: str | None = Header(default=None)):
