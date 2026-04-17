@@ -1,32 +1,49 @@
+# Imposts (ignore PyCharm will auto add and optimize this)
+
 import hashlib
 import os
 import random
+import re
 import secrets
 import smtplib
 import ssl
-import re
 from contextlib import asynccontextmanager
-from dataclasses import field
 from datetime import datetime, UTC, timedelta
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
+
+import asyncpg
 import bcrypt
 import httpx
-import asyncpg
-from fastapi import FastAPI, Header, HTTPException, Query
-from pydantic import BaseModel, Field, ConfigDict, EmailStr, field_validator
-from pathlib import Path
-from uuid import uuid4
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from fastapi import FastAPI, Header, HTTPException
 from fastapi import UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, ConfigDict, EmailStr, field_validator
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(DATABASE_URL, ssl=False)
+
+    scheduler.add_job(
+        reset_stale_streaks,
+        IntervalTrigger(hours=1),
+        id="reset_stale_streaks",
+        replace_existing=True
+    )
+    scheduler.start()
+
     yield
+
+    scheduler.shutdown()
     await app.state.db.close()
 app = FastAPI(title="DayRing API", version="1.0.0", lifespan=lifespan)
+
+scheduler = AsyncIOScheduler(timezone = "UTC")
 
 API_VERSION = 1
 DATABASE_URL = f"postgresql://atticus:{os.getenv('PSQL_PASSWORD')}@10.0.0.235:5432/dayring_api"
@@ -54,14 +71,10 @@ if not HF_API_KEY:
     raise RuntimeError("HF_API_KEY is not set")
 
 FEATURE_COSTS = {
-    "plan_day": 2,
-    "motivation": 1,
+    "plan_day": -20,
+    "motivation": -10,
 }
 
-# Temporary in-memory store
-credits = {
-    "demo_user": 100
-}
 
 # Request and response models
 class Message(BaseModel):
@@ -79,6 +92,16 @@ class ChatRequest(BaseModel):
 class CreditsResponse(BaseModel):
     user_id: str
     credits: int
+    subscription_status: str
+    subscription_product_id: str
+
+class CreditTransactionResponse(BaseModel):
+    id: int
+    amount: int
+    reason: str
+    source: str
+    related_id: str | None = None
+    created_at = datetime
 
 class SignUpRequest(BaseModel):
     email: EmailStr
@@ -161,6 +184,13 @@ class TaskResponse(BaseModel):
     updated_at: datetime
 
 
+class ClaimStreakResponse(BaseModel):
+    message: str
+    streak: int
+    longest_streak: int
+    claimed_for_date: str
+
+
 def hash_reset_code(email: str, code: str) -> str:
     value = f"{email.lower().strip()}:{code}"
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -231,6 +261,115 @@ async def get_current_user_id(authorization: str | None) -> str:
 
     return str(session["user_id"])
 
+def get_local_today(timezone_name: str | None):
+    try:
+         tz = ZoneInfo(timezone_name or "UTC")
+    except:
+        tz = ZoneInfo("UTC")
+
+    return datetime.now(tz=tz).date()
+
+async def reset_stale_streaks():
+    async with app.state.db.acquire() as conn:
+        users = conn.fetch(
+            """
+            SELECT id, streak, last_streak_date, timezone, longest_streak
+            FROM users
+            WHERE streak > 0
+            """
+        )
+
+        for user in users:
+            user_id = user["id"]
+            streak = user["streak"]
+            last_streak_date = user["last_streak_date"]
+            timezone_name = user["timezone"]
+
+            if last_streak_date is None:
+                continue
+
+            local_today = get_local_today(timezone_name)
+            yesterday = local_today - timedelta(days=1)
+
+            if last_streak_date < yesterday:
+                await conn.execute(
+                    """
+                    UPDATE users
+                    SET streak = 0
+                    WHERE id = $1
+                    """,
+                    user_id
+                )
+
+async def get_user_credits(conn, user_id: str) -> int:
+    credits = await conn.fetchval(
+        """
+        SELECT credit_balance
+        FROM users
+        WHERE id = $1
+        """,
+        user_id
+    )
+
+    if credits is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return int(credits)
+
+async def apply_credit_transaction(
+        conn,
+        user_id: str,
+        amount: int,
+        reason: str,
+        source: str,
+        related_id: str | None = None
+) -> int:
+    user = await conn.fetchrow(
+        """
+        SELECT credit_balance
+        FROM USERS
+        WHERE id = $1
+        FOR UPDATE
+        """,
+        user_id
+    )
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    credits = int(user["credit_balance"])
+    new_balance = credits + amount
+
+    if new_balance < 0:
+        raise HTTPException(status_code=402, detail="Out of credits.")
+
+    # This conn.execute block is to build credit transaction in the credit_transactions db table
+    await conn.execute(
+        """
+        INSERT INTO credit_transactions(user_id, amount, reason, source, related_id)
+        VALUES($1, $2, $3, $4, $5)
+        """,
+        user_id,
+        amount,
+        reason,
+        source,
+        related_id
+    )
+
+    await conn.execute(
+        """
+        UPDATE users
+        SET credit_balance = $1
+        WHERE user_id = $2
+        """,
+        new_balance,
+        user_id
+    )
+    
+    return new_balance
+
+
+# API ENDPOINTS
 @app.get("/health")
 async def health():
     return {
@@ -238,80 +377,6 @@ async def health():
         "model": HF_MODEL,
         "version": API_VERSION,
     }
-
-
-@app.get(f"/api/v{API_VERSION}/credits", response_model=CreditsResponse)
-async def get_credits(user_id: str = Query(..., min_length=1)):
-    if user_id not in credits:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    return CreditsResponse(user_id=user_id, credits=credits[user_id])
-
-
-@app.post(f"/api/v{API_VERSION}/chat")
-async def chat(
-    req: ChatRequest,
-    user_id: str = Query(..., min_length=1),
-    authorization: str | None = Header(default=None),
-):
-    # This is just a placeholder check for YOUR app auth, not HF auth
-    if authorization is None:
-        raise HTTPException(status_code=401, detail="Missing authorization header")
-
-    if user_id not in credits:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    cost = FEATURE_COSTS.get(req.feature, 1)
-
-    if credits[user_id] < cost:
-        raise HTTPException(status_code=402, detail="Out of credits")
-
-    payload = {
-        "model": HF_MODEL,
-        "messages": [message.model_dump() for message in req.messages],
-        "stream": False,
-    }
-
-    hf_headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(HF_URL, json=payload, headers=hf_headers)
-
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Hugging Face error: {response.text}"
-            )
-
-        data = response.json()
-
-        try:
-            reply = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            raise HTTPException(
-                status_code=502,
-                detail="Unexpected response format from Hugging Face"
-            )
-
-        credits[user_id] -= cost
-
-        return {
-            "reply": reply,
-            "credits_used": cost,
-            "credits_remaining": credits[user_id],
-            "model": HF_MODEL,
-            "feature": req.feature,
-        }
-
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Upstream request timed out")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {str(e)}")
-
 
 @app.post(f"/api/v{API_VERSION}/auth/signup")
 async def signup(req: SignUpRequest):
@@ -414,7 +479,7 @@ async def login(req: LogInRequest):
 
 @app.post(f"/api/v{API_VERSION}/auth/logout")
 async def logout(authorization: str | None = Header(default=None)):
-    user_id = get_current_user_id(authorization)
+    user_id = await get_current_user_id(authorization)
 
     async with app.state.db.acquire() as conn:
         result = await conn.execute(
@@ -597,9 +662,109 @@ async def confirm_password_reset(
         "message": "Password was reset successfully",
     }
 
+@app.get(f"/api/v{API_VERSION}/credits", response_model=CreditsResponse)
+async def get_credits(authorization: str | None = Header(default=None)):
+    user_id = await get_current_user_id(authorization)
+
+    async with app.state.db.acquire() as conn:
+        user = await conn.fetchrow(
+            """
+            SELECT id, credit_balance, subscription_status, subscription_product_id
+            FROM users
+            WHERE id = $1
+            """,
+            user_id
+        )
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        return CreditsResponse(
+            user_id = str(user["id"]),
+            credits = int(user["credit_balance"]),
+            subscription_status = user["subscription_status"],
+            subscription_product_id = user["subscription_product_id"]
+        )
+
+@app.get(f"/api/v{API_VERSION}/credits/history", response_model=list[CreditTransactionResponse])
+async def get_credit_history(authorization: str = Header(None)):
+    user_id = await get_current_user_id(authorization)
+
+    async with app.state.db.acquire() as conn:
+        rows = conn.fetch(
+            """
+            SELECT id, amount, reason, source, related_id, created_at
+            FROM credit_transactions
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            user_id
+        )
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return [CreditTransactionResponse(**row) for row in rows]
+
+@app.post(f"/app/v{API_VERSION}/chat")
+async def chat(req: ChatRequest, authorization: str = Header(None)):
+    user_id = await get_current_user_id(authorization)
+    cost = FEATURE_COSTS.get(req.feature, 1)
+
+    payload = {
+        "model": HF_MODEL,
+        "messages": [message.model_dump() for message in req.messages],
+        "stream": False
+    }
+
+    hf_headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(headers=hf_headers) as client:
+            response = await client.post(HF_URL, json=payload, headers=hf_headers)
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Hugging Face error: {response.text}")
+
+        data = response.json()
+
+        try:
+            reply = data["choices"][0]["message"]["content"]
+        except(KeyError, TypeError, IndexError):
+            raise HTTPException(status_code=502, detail="Unexpected format from Hugging Face.")
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Upstream request timed out")
+
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=504, detail=f"Upstream request failed: {str(e)}")
+
+    async with app.state.db.aquire() as conn:
+        async with conn.transaction():
+            remaining_credits = await apply_credit_transaction(
+                conn=conn,
+                user_id = user_id,
+                amount=cost,
+                reason=f"Used feature: {req.feature}.",
+                source="chat",
+                related_id=None,
+            )
+
+    return {
+        "reply": reply,
+        "credits_used": cost,
+        "credits_remaining": remaining_credits,
+        "model": HF_MODEL,
+        "feature_used": req.feature,
+    }
+
 @app.get(f"/api/v{API_VERSION}/me", response_model=GetMeResponse)
 async def get_me(authorization: str = Header(None)):
-    user_id = get_current_user_id(authorization)
+    user_id = await get_current_user_id(authorization)
 
     async with app.state.db.acquire() as conn:
         user = await conn.fetchrow(
@@ -901,3 +1066,62 @@ async def uncomplete_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     return TaskResponse(**dict(row))
+
+@app.post(f"/api/v{API_VERSION}/streak/claim", response_model=ClaimStreakResponse)
+async def streak_claim(authorization: str | None = Header(default=None)):
+    user_id = await get_current_user_id(authorization)
+    today = datetime.now(UTC).date()
+
+    async with app.state.db.aquire() as conn:
+        async with conn.transaction():
+            user = conn.fetchrow(
+                """
+                SELECT id, streak, last_streak_date, longest_streak
+                FROM users
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                user_id
+            )
+
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            last_date = user["last_streak_date"]
+            current_streak = user["streak"]
+            longest_streak = user["longest_streak"]
+
+            if last_date is None:
+                new_streak = 1
+            else:
+                diff = (today - last_date).days
+
+                if diff == 1 :
+                    new_streak = current_streak + 1
+                elif diff > 1:
+                    new_streak = 1
+                else:
+                    new_streak = current_streak
+
+            new_longest = max(new_streak, longest_streak)
+
+            await conn.execute (
+                """
+                UPDATE users
+                SET streak = $1,
+                        longest_streak = $2,
+                        last_streak_date = $3
+                WHERE id = $4
+                """,
+                new_streak,
+                new_longest,
+                today,
+                user_id
+            )
+
+    return  ClaimStreakResponse(
+        message="Streak claimed.",
+        streak=new_streak,
+        longest_streak=new_longest,
+        claimed_for_date=str(today)
+    )

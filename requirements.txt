@@ -4,3 +4,4 @@ httpx
 asyncpg
 bcrypt
 pydantic[email]
+apscheduler
