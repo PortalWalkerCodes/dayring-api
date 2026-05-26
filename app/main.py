@@ -21,6 +21,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, Header, HTTPException
 from fastapi import UploadFile, File, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ConfigDict, EmailStr, field_validator
 
@@ -60,6 +61,18 @@ SMTP_FROM_EMAIL = str(os.getenv("SMTP_FROM_EMAIL"))
 
 UPLOAD_DIR = Path("uploads/profile_pictures")
 UPLOAD_DIR.mkdir(parents= True, exist_ok= True)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "dayring.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Mounts the virtual path /uploads to the port specified in the docker-compose.yml file eg api.dayring.app/uploads
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
